@@ -40,8 +40,24 @@ def weekly_report(shop_id: str, week_start: date) -> dict:
     return {"revenue": rev, "units": units, "revenue_wow_pct": wow}
 
 def on_delta_loaded() -> None:
-    """Called by POST /load-delta, after the delta is available as source "delta".
-
-    Return only when every report is up to date.
-    """
-    raise NotImplementedError("on_delta_loaded is not implemented yet")
+    with scan_raw("delta") as d:
+        dates = [r[0] for r in db.execute(f"SELECT DISTINCT date FROM {d}").fetchall()]
+        with scan_raw("base", dates) as b:
+            db.execute("BEGIN")
+            try:
+                db.execute("DELETE FROM day_agg WHERE date IN (SELECT unnest(?::DATE[]))", [dates])
+                db.execute(f"""
+                    INSERT INTO day_agg
+                    SELECT shop_id, date, SUM(revenue), SUM(units_sold)
+                    FROM (
+                        SELECT * FROM (SELECT DISTINCT * FROM {b})
+                        ANTI JOIN {d} USING (shop_id, date, product_id)
+                        UNION ALL
+                    SELECT DISTINCT * FROM {d}
+                    )
+                    GROUP BY shop_id, date
+                """)
+            except Exception as e:
+                db.execute("ROLLBACK")
+                raise e
+            db.execute("COMMIT")

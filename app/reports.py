@@ -23,16 +23,21 @@ def startup() -> None:
             FROM (SELECT DISTINCT * FROM {t})
             GROUP BY shop_id, date
         """)
-    
+
+def _week_total(shop_id: str, week_start: date) -> tuple[int, int]:
+    end = week_start + timedelta(days=7)   # batas akhir, eksklusif
+    row = db.execute(
+        "SELECT COALESCE(SUM(revenue), 0), COALESCE(SUM(units), 0) "
+        "FROM day_agg WHERE shop_id = ? AND date >= ? AND date < ?",
+        [shop_id, week_start, end],
+    ).fetchone()
+    return int(row[0]), int(row[1])
 
 def weekly_report(shop_id: str, week_start: date) -> dict:
-    """Return the report for one shop and one ISO week.
-
-    `week_start` is the Monday of the requested week. The result must include
-    `revenue` and `units` (integers) and `revenue_wow_pct` (a number or None).
-    """
-    raise NotImplementedError("weekly_report is not implemented yet")
-
+    rev, units = _week_total(shop_id, week_start)
+    prev_rev, _ = _week_total(shop_id, week_start - timedelta(days=7))
+    wow = None if prev_rev == 0 else 100 * (rev - prev_rev) / prev_rev
+    return {"revenue": rev, "units": units, "revenue_wow_pct": wow}
 
 def on_delta_loaded() -> None:
     """Called by POST /load-delta, after the delta is available as source "delta".

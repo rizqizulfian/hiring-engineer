@@ -8,17 +8,22 @@ Rules (see the README):
 `app/main.py` calls these three functions. Add any helpers you need.
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 from app.raw import db, scan_raw  # noqa: F401
 
 
 def startup() -> None:
-    """Called once when the service starts, before it accepts requests.
-
-    Precompute here if your design needs it. Leaving it empty is fine.
-    """
-
+    dates = [date(2025, 2, 10) + timedelta(days=i) for i in range(39)]  # sampai 2025-03-20
+    db.execute("CREATE TABLE IF NOT EXISTS day_agg (shop_id VARCHAR, date DATE, revenue BIGINT, units BIGINT)")
+    with scan_raw("base", dates) as t:
+        db.execute(f"""
+            INSERT INTO day_agg
+            SELECT shop_id, date, SUM(revenue), SUM(units_sold)
+            FROM (SELECT DISTINCT * FROM {t})
+            GROUP BY shop_id, date
+        """)
+    
 
 def weekly_report(shop_id: str, week_start: date) -> dict:
     """Return the report for one shop and one ISO week.

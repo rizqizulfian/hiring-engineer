@@ -14,8 +14,13 @@ from app.raw import db, scan_raw  # noqa: F401
 
 
 def startup() -> None:
+    exists = db.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'day_agg'"
+    ).fetchone()[0]
+    if exists:
+        return
     dates = [date(2025, 2, 10) + timedelta(days=i) for i in range(39)]  # sampai 2025-03-20
-    db.execute("CREATE TABLE IF NOT EXISTS day_agg (shop_id VARCHAR, date DATE, revenue BIGINT, units BIGINT)")
+    db.execute("CREATE TABLE day_agg (shop_id VARCHAR, date DATE, revenue BIGINT, units BIGINT)")
     with scan_raw("base", dates) as t:
         db.execute(f"""
             INSERT INTO day_agg

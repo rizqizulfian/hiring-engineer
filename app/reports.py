@@ -8,30 +8,61 @@ Rules (see the README):
 `app/main.py` calls these three functions. Add any helpers you need.
 """
 
-from datetime import date
+from datetime import date, timedelta
 
 from app.raw import db, scan_raw  # noqa: F401
 
 
 def startup() -> None:
-    """Called once when the service starts, before it accepts requests.
+    exists = db.execute(
+        "SELECT count(*) FROM information_schema.tables WHERE table_name = 'day_agg'"
+    ).fetchone()[0]
+    if exists:
+        return
+    dates = [date(2025, 2, 10) + timedelta(days=i) for i in range(39)]  # sampai 2025-03-20
+    db.execute("CREATE TABLE day_agg (shop_id VARCHAR, date DATE, revenue BIGINT, units BIGINT)")
+    with scan_raw("base", dates) as t:
+        db.execute(f"""
+            INSERT INTO day_agg
+            SELECT shop_id, date, SUM(revenue), SUM(units_sold)
+            FROM (SELECT DISTINCT * FROM {t})
+            GROUP BY shop_id, date
+        """)
 
-    Precompute here if your design needs it. Leaving it empty is fine.
-    """
-
+def _week_total(shop_id: str, week_start: date) -> tuple[int, int]:
+    end = week_start + timedelta(days=7)   # batas akhir, eksklusif
+    row = db.execute(
+        "SELECT COALESCE(SUM(revenue), 0), COALESCE(SUM(units), 0) "
+        "FROM day_agg WHERE shop_id = ? AND date >= ? AND date < ?",
+        [shop_id, week_start, end],
+    ).fetchone()
+    return int(row[0]), int(row[1])
 
 def weekly_report(shop_id: str, week_start: date) -> dict:
-    """Return the report for one shop and one ISO week.
-
-    `week_start` is the Monday of the requested week. The result must include
-    `revenue` and `units` (integers) and `revenue_wow_pct` (a number or None).
-    """
-    raise NotImplementedError("weekly_report is not implemented yet")
-
+    rev, units = _week_total(shop_id, week_start)
+    prev_rev, _ = _week_total(shop_id, week_start - timedelta(days=7))
+    wow = None if prev_rev == 0 else 100 * (rev - prev_rev) / prev_rev
+    return {"revenue": rev, "units": units, "revenue_wow_pct": wow}
 
 def on_delta_loaded() -> None:
-    """Called by POST /load-delta, after the delta is available as source "delta".
-
-    Return only when every report is up to date.
-    """
-    raise NotImplementedError("on_delta_loaded is not implemented yet")
+    with scan_raw("delta") as d:
+        dates = [r[0] for r in db.execute(f"SELECT DISTINCT date FROM {d}").fetchall()]
+        with scan_raw("base", dates) as b:
+            db.execute("BEGIN")
+            try:
+                db.execute("DELETE FROM day_agg WHERE date IN (SELECT unnest(?::DATE[]))", [dates])
+                db.execute(f"""
+                    INSERT INTO day_agg
+                    SELECT shop_id, date, SUM(revenue), SUM(units_sold)
+                    FROM (
+                        SELECT * FROM (SELECT DISTINCT * FROM {b})
+                        ANTI JOIN {d} USING (shop_id, date, product_id)
+                        UNION ALL
+                    SELECT DISTINCT * FROM {d}
+                    )
+                    GROUP BY shop_id, date
+                """)
+            except Exception as e:
+                db.execute("ROLLBACK")
+                raise e
+            db.execute("COMMIT")

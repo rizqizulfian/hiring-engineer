@@ -1,153 +1,154 @@
-# Nesra Scale - Software Engineer Take-Home Task
+# Weekly report with a cost-aware cache
 
-*Nesra, Surabaya. Please read the whole document before you start.*
+Take-home for Nesra Scale (Software Engineer). All of my work is in `app/reports.py`
+and `tests/test_reports.py`. The original task description is in the git history
+of this repository (first commit).
 
-## 1. Welcome
+Result: `measure.py` **PASS**, total **Rp 14,505.95** (budget: under Rp 20,000),
+13,500 requests, 100% correct, 0 stale.
 
-Thank you for your interest in joining Nesra. This task is a small, realistic version of a problem we solve every day. We want to see how you think, not how many hours you can spend.
+## Cache design
 
-- **Timebox:** about 2 to 3 hours of work. We give you a working starter, so your time goes into the interesting part: caching and invalidation.
-- **Suggested split:** 30 minutes looking at the data, 90 minutes on the cache and invalidation, 30 minutes on your README.
-- **Unfinished is OK.** If you run out of time, write down what is missing and how you would finish it.
+**What is cached.** One DuckDB table: `day_agg(shop_id, date, revenue, units)`,
+the total revenue and units per shop per day. A day is the smallest piece that
+can be added up into any week, and when a day is corrected only that day's rows
+have to be replaced. Reports never read raw rows once the cache is filled.
 
-## 2. About Nesra Scale
+**Precompute at startup.** `startup()` scans the base data once for W07 to W12
+(2025-02-10 to 2025-03-20, 226,163 rows) and sums per shop per day. W07 is
+included because it is the "last week" of W08. Older weeks are never requested,
+so scanning all 90 days (Rp 25,810) would waste most of the budget.
+If `day_agg` already exists, `startup()` returns immediately, so calling it
+again (for example by a second `TestClient`) does not double the totals or
+cost anything.
 
-Nesra Scale is a marketing-data product. It collects shop, ads and sales data from marketplaces such as TikTok Shop and Shopee, and shows brands simple insights about their business.
+**Serving a report.** `weekly_report()` adds up the 7 days of the requested week
+and the 7 days of the previous week from `day_agg` (Rp 0 per request). A shop or
+week without rows gives `0, 0`. WoW is computed when the report is read:
+`100 * (this - last) / last`, and `null` when last week's revenue is 0.
+I do not store WoW because it is derived from two weekly totals: storing it
+would mean updating it in two places whenever one day is corrected.
 
-In production we use **BigQuery + dbt** for data, **Prefect** for pipelines, and **Cloudflare Workers** for serving. BigQuery charges by how much data a query scans, so every unnecessary read costs real money. That is why this task is about one thing:
+**When the delta arrives** (`on_delta_loaded()`), step by step:
 
-**Cost-aware caching: serve fast, correct reports while reading as little raw data as possible.**
+1. Scan the whole delta (17,458 rows) and collect the dates it contains:
+   3 new days (03-21 to 03-23) and 8 older days that have corrections.
+2. Scan the base data only for those dates (46,498 rows). The new days have
+   no base rows, so they cost nothing there.
+3. For those dates, merge: base rows whose key `(shop_id, product_id, date)`
+   is not in the delta, plus all delta rows. Delta rows replace base rows.
+4. Inside one transaction, delete those dates from `day_agg` and insert the
+   recomputed totals. On any error the transaction is rolled back, so a
+   report never sees a half-updated cache.
 
-## 3. The data
+Only 11 days are recomputed. Every other day stays cached and costs nothing.
+Recomputing all 90 days instead would cost Rp 26,683 and fail the budget.
+Reports for older weeks (W10 and W11) are corrected too, because the corrected
+days are inside those weeks.
 
-The data is in [`data/`](data/). One row is one product in one shop on one day. The column names, types and meanings are in [`data/data_dictionary.md`](data/data_dictionary.md).
+## Cost
 
-- **`shops_90d.csv.gz`** - 500 shops x 90 days of daily product sales, 21 December 2024 to 20 March 2025. It is based on real data, but masked (names, IDs and amounts are changed).
-- **`delta.csv.gz`** - new data that arrives after the first load. It contains new days, and also some **late corrections to older days**.
+`measure.py` scorecard (fresh service):
 
-**The data is real-world messy.** Look at it carefully before you trust it. Handle any problems in a sensible way, and write down what you found and what you decided.
+| | Rp |
+| :-- | --: |
+| Startup (226,163 rows) | 11,308.15 |
+| Phase 1, 7,500 requests | 0.00 |
+| Delta (17,458 + 46,498 rows) | 3,197.80 |
+| Phase 2, 6,000 requests | 0.00 |
+| **Total** | **14,505.95** |
 
-## 4. The starter
+13,500 requests, correct 100% (7422/7422 before, 5943/5943 after the delta),
+0 stale keys. Latency p50 about 12 ms.
 
-The repository is a working Python service. You need [uv](https://docs.astral.sh/uv/) installed.
+**Naive version (no cache).** Each report scans its week and the previous week:
+about 80,000 rows, roughly Rp 4,000 per request. For the same 13,500 requests
+that is about **Rp 53.5 million**, around 2,700 times the budget. For the
+production load in the task (500 shops, 20 requests a day, 30 days = 300,000
+requests) it is about Rp 1.17 billion a month, assuming requests are spread
+evenly over the weeks.
 
-```
-./run.sh                 # starts the service on http://localhost:8000
-uv run pytest            # runs the tests
-```
+## Data issues
 
-| File | What it is |
-| :---- | :---- |
-| `app/raw.py` | **Done.** Loads the raw data, provides `scan_raw()`, and counts the scan cost. |
-| `app/main.py` | **Done.** The HTTP routes. |
-| `app/reports.py` | **Your work.** Three empty functions: `startup()`, `weekly_report()` and `on_delta_loaded()`. |
-| `tests/` | One example test to start from. |
+I profiled the data before choosing the design. What I found, and what I did:
 
-You can add files and helpers, and change the starter if you have a good reason. Say why in your README.
+- **69 exact duplicate rows** in the base data, on 4 shop-days (SHP285014,
+  SHP866221, SHP422010, SHP332806). I remove them with `SELECT DISTINCT`
+  before summing, which is what the reference in `measure.py` does.
+- **12 correction rows** in the delta that overwrite base rows (same shop,
+  product and date) on 8 older dates. 9 change the numbers, 3 are identical.
+  Delta rows win.
+- **3 rows with negative revenue** (negative price) and **3 rows with price 0**
+  and units sold. I keep them as they are, since I cannot tell if they are
+  errors or returns and the reference also keeps them.
+- **NULL `ad_spend`** in about 0.7% of rows. Not used by the report.
+- **Partial week W12** (base ends 03-20, delta adds 03-21 to 03-23). I count
+  whatever days exist.
+- `measure.py` marks some shop-weeks as `data_issue`. I explained three of
+  the six shops (negative revenue or price 0). For SHP042488, SHP483681 and
+  SHP860524 I did not find a cause.
+- Some shops have revenue 0 in a week (or no rows at all), so WoW is `null`
+  for the following week.
 
-## 5. What to build
+## Tests
 
-The service has this endpoint:
+`tests/test_reports.py` (run `uv run pytest -v`):
 
-```
-GET /shops/{shop_id}/weekly-report?week=YYYY-Www
-```
+- Calling `startup()` twice does not double the cache or add cost.
+- After `POST /load-delta` the extra scan is exactly 63,956 rows, and the
+  corrected week changes (SHP141660, W10: revenue 429,524,900 to 429,344,900,
+  units 1,819 to 1,818).
 
-`week` is an ISO week, for example `2025-W11`. The JSON response must include:
+## Trade-offs
 
-| Field | Type | Meaning |
-| :---- | :---- | :---- |
-| `revenue` | integer | Total revenue of the shop in that week |
-| `units` | integer | Total units sold in that week |
-| `revenue_wow_pct` | number or `null` | Week-over-week change in revenue, in percent |
+- **Daily totals vs weekly totals.** Daily rows are a bit bigger than weekly
+  ones (7x rows) but a correction touches one day, and any week can be built
+  from them. Weekly totals would force recomputing a whole week for one
+  corrected row.
+- **Precompute vs on-demand.** Precomputing W07 to W12 costs Rp 11,308 up front
+  even for shops nobody opens, but serving is free and predictable. On-demand
+  filling would save that if few reports are opened, but the first request of
+  each week would pay for a scan.
+- **Precise refresh vs flush everything.** Refreshing only the dates in the
+  delta is cheaper (Rp 3,198 vs Rp 26,684) but depends on trusting that the
+  delta lists every changed date. Flushing is simpler and safer, and too
+  expensive here.
+- **Compute WoW on read vs store it.** Computing it is almost free and cannot go
+  stale; storing it would be one more thing to invalidate.
+- **In memory.** Same lifetime as the raw data in this starter, so there is no
+  inconsistency to handle, but a restart means paying the startup cost again.
 
-Nothing else is required. Do not spend time on extra fields.
+## Next steps
 
-These rules are fixed, because `measure.py` checks them:
+- Persist the cache (a DuckDB file or a warehouse table) so a restart does not
+  repeat the Rp 11,308 startup scan.
+- Make `on_delta_loaded()` retryable if it fails halfway.
+- Refresh only the dates whose rows really changed (3 of the 12 corrections
+  are identical to the base).
+- Add tests for edge cases: shop without rows, WoW `null`, delta loaded twice.
+- Extend the cache automatically when new weeks arrive, instead of a fixed
+  W07 to W12 window.
 
-- **Weeks** are ISO weeks, Monday to Sunday.
-- **Partial weeks count.** `shops_90d.csv.gz` ends on Thursday 20 March 2025, so `2025-W12` has only 4 days of data before the delta arrives. Return the totals of the days that exist. Do not return `null` or an error for an incomplete week.
-- **A shop with no rows in a week** gets `revenue: 0` and `units: 0`, not an error.
-- **`revenue_wow_pct`** is `100 * (this week - previous week) / previous week`, using revenue. It is `null` when there is no previous week **or** when the previous week's revenue is 0.
+## Notes
 
-## 6. Pretend the database is expensive
+**AI use.** I used Claude Code (Claude Sonnet 5.5) for most of this work, and I
+want to be clear about who did what.
+- **Claude** read the repository, profiled the data (duplicates, corrections,
+  row counts per date), built the cost model and proposed the design: a daily
+  aggregate table, precompute for W07 to W12, and a delta refresh that only
+  recomputes the dates the delta touches.
+- **Me:** While Claude was analysing, I read the repository, skimmed the data
+  and thought about the design myself. I chose to implement `app/reports.py` and the tests myself, step by
+  step with Claude explaining each part. I ran everything locally, checked the
+  numbers against `/stats` and `measure.py`, and wrote the tests that prove the
+  cache is not doubled and that the delta refreshes the corrected week.
+- Claude also helped me review my code and write this README. I read and edited
+  the result, and I can explain the trade-offs (why daily totals, why WoW is not
+  stored, why the delta refresh is one transaction) and change any line live.
 
-In this task, reading raw data is "expensive", like BigQuery. `app/raw.py` already handles this for you:
-
-- **`scan_raw(source, dates)` is the only way to read raw rows.** Do not read the raw tables or the CSV files anywhere else.
-- Like a BigQuery table partitioned by date, a scan pays for **every row on each date it reads, for all shops**, even if you only need one shop. The rate is Rp 0.05 per row.
-- Every scan is logged, and `GET /stats` returns the running totals.
-
-Reads from your own cache tables are free. Your cache must be **DuckDB tables holding aggregated results** (for example per shop and day, or per shop and week), not a copy of the raw rows.
-
-## 7. Budget goal
-
-Imagine this production load: a weekly report for **all 500 shops, every day, for one month**, each requested **20 times a day** (users refresh, share, open on mobile, and so on).
-
-`measure.py` simulates a small version of this. It requests weekly reports for every shop, calls `POST /load-delta`, requests them again, checks every answer and reads `GET /stats`. Run it against a **freshly started** service, because the cost counters start from zero:
-
-```
-./run.sh                                      # in one terminal
-uv run measure.py --url http://localhost:8000 # in another
-```
-
-It prints a scorecard and writes the details to `measure_result.json`.
-
-**Target: the run passes, with a total under Rp 20,000.** For scale, scanning raw data on every request costs tens of millions. Cheaper is better.
-
-## 8. Cache invalidation (the important part)
-
-New data arrives after reports are already cached. When `POST /load-delta` is called, the starter makes the delta available as source `"delta"` and calls your `on_delta_loaded()`. You must:
-
-1. Return only when your reports are up to date.
-2. Make **affected reports refresh** with the new correct numbers. This includes reports for **older weeks** that changed because of late corrections.
-3. Keep **unaffected reports cached**, so they cost **nothing** to serve again.
-
-A short test or log output that proves this is very welcome.
-
-## 9. Your README
-
-Replace this file with your own README. Keep it short; one page is enough. It must include:
-
-- **Cache design** - what you cache, the cache keys, precompute or on-demand, and what happens step by step when the delta arrives.
-- **Cost** - the `measure.py` scorecard, and a rough estimate of what a naive version (no cache) would cost, so we can compare.
-- **Data issues** - what problems you found in the data and how you handled them.
-- **Notes** - how you used AI tools (see below), and anything unfinished.
-
-## 10. AI tools
-
-AI tools (Codex, Claude Code, Cursor and others) are **allowed and expected**. We use them every day.
-
-- In your README, say **how** you used them: which tools, for which parts, and what you changed or fixed yourself.
-- You must be able to **explain and modify any line** of your code live in the interview.
-
-## 11. How to submit
-
-- Start from this repository: click **Use this template** on GitHub to create your own copy.
-- Push your work to a **public GitHub repository**.
-- Send the repository link to the email or WhatsApp this task came with.
-
-## 12. How we evaluate
-
-| Area | Weight | What we look for |
-| :---- | :---- | :---- |
-| Cache design & invalidation correctness | 40% | Sensible keys, precise invalidation (including late corrections), no stale reports, unaffected reports stay cached |
-| Cost | 25% | A passing `measure.py` run, smart choices to reduce scans, clear comparison with a naive version |
-| Code quality & correctness | 15% | Readable code, correct revenue, units and WoW, a test that shows invalidation works |
-| Data-issue handling | 10% | You noticed real problems, handled them sensibly, and documented your decisions |
-| README communication | 10% | Clear, honest and short, including trade-offs and what is unfinished |
-
-We value **clear thinking and honest trade-offs** more than lots of features.
-
-## 13. What happens next
-
-If your submission is a good fit, we will invite you to a **60-minute interview**:
-
-- You walk us through your solution.
-- We discuss how you work with AI tools.
-
-## 14. Questions
-
-If something is unclear, make a reasonable assumption, write it in your README, and continue. You can also reply to the email with questions.
-
-Good luck, and have fun!
+**Not done / limits.**
+- The cache lives in memory (same as the raw data), so a restart loses both.
+  I did not make it persistent.
+- Only W07 to W12 are cached, which is what the task requests.
+- If `on_delta_loaded()` fails halfway, the rollback keeps the old cache, but
+  the starter marks the delta as loaded, so a second POST cannot retry it.
